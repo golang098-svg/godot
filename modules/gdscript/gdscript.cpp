@@ -2064,6 +2064,9 @@ void GDScriptInstance::reload_members() {
 		const GDScript::MemberInfo *old = script->old_member_indices.getptr(E.key);
 		if (old != nullptr) {
 			Variant value = members[old->index];
+			if (!E.value.data_type.is_type(value)) {
+				value = GDScriptFunction::_get_default_variant_for_data_type(E.value.data_type);
+			}
 			new_members[E.value.index] = value;
 		}
 	}
