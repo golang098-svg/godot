@@ -1,5 +1,5 @@
 /**************************************************************************/
-/*  gdscript_test_runner.h                                                */
+/*  gdscript_test_runner_suite.h                                          */
 /**************************************************************************/
 /*                         This file is part of:                          */
 /*                             GODOT ENGINE                               */
@@ -30,105 +30,189 @@
 
 #pragma once
 
-#include "core/error/error_macros.h"
-#include "core/string/print_string.h"
-#include "core/string/string_name.h"
-#include "core/string/ustring.h"
-#include "core/templates/vector.h"
+#include "../gdscript_cache.h"
+#include "../gdscript_parser.h"
+#include "gdscript_test_runner.h"
+
+#include "core/io/file_access.h"
+#include "core/io/resource_loader.h"
+#include "tests/test_macros.h"
+#include "tests/test_utils.h"
+
+#ifdef TOOLS_ENABLED
+#include "core/os/os.h"
+#endif
 
 namespace GDScriptTests {
 
-void init_autoloads();
-void init_language(const String &p_base_path);
-void finish_language();
-
-// Single test instance in a suite.
-class GDScriptTest {
+class TestGDScriptCacheAccessor {
 public:
-	enum TestStatus {
-		GDTEST_OK,
-		GDTEST_LOAD_ERROR,
-		GDTEST_PARSER_ERROR,
-		GDTEST_ANALYZER_ERROR,
-		GDTEST_COMPILER_ERROR,
-		GDTEST_RUNTIME_ERROR,
-	};
+	static bool has_shallow(String p_path) {
+		return GDScriptCache::singleton->shallow_gdscript_cache.has(p_path);
+	}
 
-	struct TestResult {
-		TestStatus status;
-		String output;
-		bool passed;
-	};
+	static bool has_full(String p_path) {
+		return GDScriptCache::singleton->full_gdscript_cache.has(p_path);
+	}
+};
 
-	enum TokenizerMode {
-		TOKENIZER_TEXT,
-		TOKENIZER_BUFFER,
-	};
+// TODO: Handle some cases failing on release builds. See: https://github.com/godotengine/godot/pull/88452
+#ifdef TOOLS_ENABLED
+TEST_SUITE("[Modules][GDScript]") {
+	TEST_CASE("Script compilation and runtime") {
+		bool print_filenames = OS::get_singleton()->get_cmdline_args().find("--print-filenames") != nullptr;
+		bool use_binary_tokens = OS::get_singleton()->get_cmdline_args().find("--use-binary-tokens") != nullptr;
+		GDScriptTestRunner runner("modules/gdscript/tests/scripts", print_filenames, use_binary_tokens);
+		int fail_count = runner.run_tests();
+		INFO("Make sure `*.out` files have expected results.");
+		REQUIRE_MESSAGE(fail_count == 0, "All GDScript tests should pass.");
+	}
+}
+#endif // TOOLS_ENABLED
 
-private:
-	struct ErrorHandlerData {
-		TestResult *result = nullptr;
-		GDScriptTest *self = nullptr;
-		ErrorHandlerData(TestResult *p_result, GDScriptTest *p_this) {
-			result = p_result;
-			self = p_this;
+#ifdef DEBUG_ENABLED
+TEST_CASE("[Modules][GDScript] Hot reload resets members whose type changed") {
+	GDScriptLanguage::get_singleton()->init();
+	Ref<GDScript> gdscript = memnew(GDScript);
+	gdscript->set_source_code(R"(
+extends RefCounted
+
+var value: int = 1
+
+func read_value() -> int:
+	return value
+)");
+	REQUIRE(gdscript->reload() == OK);
+
+	Ref<RefCounted> instance_owner = memnew(RefCounted);
+	instance_owner->set_script(gdscript);
+	GDScriptInstance *instance = static_cast<GDScriptInstance *>(instance_owner->get_script_instance());
+	REQUIRE(instance != nullptr);
+	REQUIRE(instance->set("value", 42));
+
+	gdscript->set_source_code(R"(
+extends RefCounted
+
+var value: String = ""
+
+func read_value() -> int:
+	return value.length()
+)");
+	REQUIRE(gdscript->reload(true) == OK);
+
+	Callable::CallError call_error;
+	Variant result = instance->callp("read_value", nullptr, 0, call_error);
+	CHECK(call_error.error == Callable::CallError::CALL_OK);
+	CHECK(result.get_type() == Variant::INT);
+	CHECK(int(result) == 0);
+}
+#endif // DEBUG_ENABLED
+
+TEST_CASE("[Modules][GDScript] Load source code dynamically and run it") {
+	GDScriptLanguage::get_singleton()->init();
+	Ref<GDScript> gdscript = memnew(GDScript);
+	gdscript->set_source_code(R"(
+extends RefCounted
+
+func _init():
+	set_meta("result", 42)
+)");
+	// A spurious `Condition "err" is true` message is printed (despite parsing being successful and returning `OK`).
+	// Silence it.
+	ERR_PRINT_OFF;
+	const Error error = gdscript->reload();
+	ERR_PRINT_ON;
+	CHECK_MESSAGE(error == OK, "The script should parse successfully.");
+
+	// Run the script by assigning it to a reference-counted object.
+	Ref<RefCounted> ref_counted = memnew(RefCounted);
+	ref_counted->set_script(gdscript);
+	CHECK_MESSAGE(int(ref_counted->get_meta("result")) == 42, "The script should assign object metadata successfully.");
+}
+
+TEST_CASE("[Modules][GDScript] Loading keeps ResourceCache and GDScriptCache in sync") {
+	GDScriptLanguage::get_singleton()->init();
+	const String path = TestUtils::get_temp_path("gdscript_load_test.gd");
+
+	{
+		Ref<FileAccess> fa = FileAccess::open(path, FileAccess::ModeFlags::WRITE);
+		fa->store_string("extends Node\n");
+		fa->close();
+	}
+
+	CHECK(!ResourceCache::has(path));
+	CHECK(!TestGDScriptCacheAccessor::has_shallow(path));
+	CHECK(!TestGDScriptCacheAccessor::has_full(path));
+
+	Ref<GDScript> loaded = ResourceLoader::load(path);
+
+	CHECK(ResourceCache::has(path));
+	CHECK(!TestGDScriptCacheAccessor::has_shallow(path));
+	CHECK(TestGDScriptCacheAccessor::has_full(path));
+}
+
+TEST_CASE("[Modules][GDScript] Validate built-in API") {
+	GDScriptLanguage *lang = GDScriptLanguage::get_singleton();
+
+	// Validate methods.
+	List<MethodInfo> builtin_methods;
+	lang->get_public_functions(&builtin_methods);
+
+	SUBCASE("[Modules][GDScript] Validate built-in methods") {
+		for (const MethodInfo &mi : builtin_methods) {
+			for (int64_t i = 0; i < mi.arguments.size(); ++i) {
+				TEST_COND((mi.arguments[i].name.is_empty() || mi.arguments[i].name.begins_with("_unnamed_arg")),
+						vformat("Unnamed argument in position %d of built-in method '%s'.", i, mi.name));
+			}
 		}
-	};
+	}
 
-	String source_file;
-	String output_file;
-	String base_dir;
+	// Validate annotations.
+	List<MethodInfo> builtin_annotations;
+	lang->get_public_annotations(&builtin_annotations);
 
-	PrintHandlerList _print_handler;
-	ErrorHandlerList _error_handler;
+	SUBCASE("[Modules][GDScript] Validate built-in annotations") {
+		for (const MethodInfo &ai : builtin_annotations) {
+			for (int64_t i = 0; i < ai.arguments.size(); ++i) {
+				TEST_COND((ai.arguments[i].name.is_empty() || ai.arguments[i].name.begins_with("_unnamed_arg")),
+						vformat("Unnamed argument in position %d of built-in annotation '%s'.", i, ai.name));
+			}
+		}
+	}
+}
 
-	TokenizerMode tokenizer_mode = TOKENIZER_TEXT;
+static void check_single_multiline_string_error(const String &p_string, int p_start_line, int p_start_column, int p_end_line, int p_end_column, const String &p_message) {
+	const String source = String("var s = \"\"\"\n") + p_string + "\n\"\"\"\n";
 
-	void enable_stdout();
-	void disable_stdout();
-	bool check_output(const String &p_output) const;
-	String get_text_for_status(TestStatus p_status) const;
+	GDScriptParser parser;
+	parser.parse(source, "", false);
+	const List<GDScriptParser::ParserError> &errors = parser.get_errors();
 
-	TestResult execute_test_code(bool p_is_generating);
+	REQUIRE_MESSAGE(errors.size() == 1, vformat("Expected exactly one error, got %d.", errors.size()));
 
-public:
-	static void print_handler(void *p_this, const String &p_message, bool p_error, bool p_rich);
-	static void error_handler(void *p_this, const char *p_function, const char *p_file, int p_line, const char *p_error, const char *p_explanation, bool p_editor_notify, ErrorHandlerType p_type);
-	TestResult run_test();
-	bool generate_output();
+	const GDScriptParser::ParserError &error = errors.front()->get();
 
-	const String &get_source_file() const { return source_file; }
-	const String get_source_relative_filepath() const { return source_file.trim_prefix(base_dir); }
-	const String &get_output_file() const { return output_file; }
+	CHECK(error.start_line == p_start_line);
+	CHECK(error.start_column == p_start_column);
+	CHECK(error.end_line == p_end_line);
+	CHECK(error.end_column == p_end_column);
+	CHECK(error.message == p_message);
+}
 
-	void set_tokenizer_mode(TokenizerMode p_tokenizer_mode) { tokenizer_mode = p_tokenizer_mode; }
-	TokenizerMode get_tokenizer_mode() const { return tokenizer_mode; }
-
-	GDScriptTest(const String &p_source_path, const String &p_output_path, const String &p_base_dir);
-	GDScriptTest() :
-			GDScriptTest(String(), String(), String()) {} // Needed to use in Vector.
-};
-
-class GDScriptTestRunner {
-	String source_dir;
-	Vector<GDScriptTest> tests;
-
-	bool is_generating = false;
-	bool print_filenames; // Whether filenames should be printed when generated/running tests
-	bool binary_tokens; // Test with buffer tokenizer.
-
-	bool make_tests();
-	bool make_tests_for_dir(const String &p_dir);
-	bool generate_class_index();
-
-public:
-	static StringName test_function_name;
-
-	int run_tests();
-	bool generate_outputs();
-
-	GDScriptTestRunner(const String &p_source_dir, bool p_print_filenames = false, bool p_use_binary_tokens = false);
-	~GDScriptTestRunner();
-};
+// These can't be part of the regular parser tests because they cannot test the position information of errors.
+TEST_CASE("[Modules][GDScript] Validate multi-line string error positions") {
+	check_single_multiline_string_error(String::chr(0x200E), 2, 1, 2, 2, "Invisible text direction control character present in the string, escape it (\"\\u200e\") to avoid confusion.");
+	check_single_multiline_string_error("\\Uzzzzzz", 2, 3, 2, 4, "Invalid hexadecimal digit in unicode escape sequence.");
+	check_single_multiline_string_error("\\p", 2, 1, 2, 3, "Invalid escape in string.");
+	check_single_multiline_string_error("abc\ndef\nghi\\p", 4, 4, 4, 6, "Invalid escape in string.");
+	check_single_multiline_string_error("\\uD800\\uD800", 2, 11, 2, 13, "Invalid UTF-16 sequence in string, unpaired lead surrogate.");
+	check_single_multiline_string_error("\\uDC00", 2, 5, 2, 7, "Invalid UTF-16 sequence in string, unpaired trail surrogate.");
+	check_single_multiline_string_error("\\uD800\\u0041", 2, 5, 2, 7, "Invalid UTF-16 sequence in string, unpaired lead surrogate.");
+	check_single_multiline_string_error("\\uD800\"abc", 2, 5, 2, 7, "Invalid UTF-16 sequence in string, unpaired lead surrogate");
+	check_single_multiline_string_error("\\uD800x", 2, 5, 2, 7, "Invalid UTF-16 sequence in string, unpaired lead surrogate");
+	check_single_multiline_string_error("\\uD800\\\n\\u0041", 2, 5, 2, 7, "Invalid UTF-16 sequence in string, unpaired lead surrogate.");
+	check_single_multiline_string_error("\\uD800\\", 2, 5, 2, 7, "Invalid UTF-16 sequence in string, unpaired lead surrogate");
+	check_single_multiline_string_error("\\uD800\\\nx", 2, 5, 2, 7, "Invalid UTF-16 sequence in string, unpaired lead surrogate");
+}
 
 } // namespace GDScriptTests
