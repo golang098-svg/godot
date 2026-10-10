@@ -149,6 +149,8 @@ public:
 };
 
 class GDScriptFunction {
+	friend class GDScriptInstance;
+
 public:
 	enum Opcode {
 		OPCODE_OPERATOR,
@@ -457,7 +459,7 @@ private:
 	String _get_callable_call_error(const String &p_where, const Callable &p_callable, const Variant **p_argptrs, int p_argcount, const Variant &p_ret, const Callable::CallError &p_err) const;
 #endif
 
-	Variant _get_default_variant_for_data_type(const GDScriptDataType &p_data_type);
+	static Variant _get_default_variant_for_data_type(const GDScriptDataType &p_data_type);
 
 public:
 	static constexpr int MAX_CALL_DEPTH = 2048; // Limit to try to avoid crash because of a stack overflow.
